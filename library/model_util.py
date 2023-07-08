@@ -949,7 +949,7 @@ def is_safetensors(path):
     return os.path.splitext(path)[1].lower() == ".safetensors"
 
 
-def load_checkpoint_with_text_encoder_conversion(ckpt_path, device="cpu"):
+def load_checkpoint_with_text_encoder_conversion(ckpt_path, device="cuda"):
     # text encoderの格納形式が違うモデルに対応する ('text_model'がない)
     TEXT_ENCODER_KEY_REPLACEMENTS = [
         ("cond_stage_model.transformer.embeddings.", "cond_stage_model.transformer.text_model.embeddings."),
@@ -983,7 +983,7 @@ def load_checkpoint_with_text_encoder_conversion(ckpt_path, device="cpu"):
 
 
 # TODO dtype指定の動作が怪しいので確認する text_encoderを指定形式で作れるか未確認
-def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dtype=None, unet_use_linear_projection_in_v2=True):
+def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cuda", dtype=None, unet_use_linear_projection_in_v2=True):
     _, state_dict = load_checkpoint_with_text_encoder_conversion(ckpt_path, device)
 
     # Convert the UNet2DConditionModel model.
@@ -1166,7 +1166,7 @@ def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_p
             key = prefix + k
             assert not strict or key in state_dict, f"Illegal key in save SD: {key}"
             if save_dtype is not None:
-                v = v.detach().clone().to("cpu").to(save_dtype)
+                v = v.detach().clone().to("cuda").to(save_dtype)
             state_dict[key] = v
 
     # Convert the UNet model
@@ -1258,10 +1258,10 @@ def load_vae(vae_id, dtype):
 
     if vae_id.endswith(".bin"):
         # SD 1.5 VAE on Huggingface
-        converted_vae_checkpoint = torch.load(vae_id, map_location="cpu")
+        converted_vae_checkpoint = torch.load(vae_id, map_location="cuda")
     else:
         # StableDiffusion
-        vae_model = load_file(vae_id, "cpu") if is_safetensors(vae_id) else torch.load(vae_id, map_location="cpu")
+        vae_model = load_file(vae_id, "cuda") if is_safetensors(vae_id) else torch.load(vae_id, map_location="cuda")
         vae_sd = vae_model["state_dict"] if "state_dict" in vae_model else vae_model
 
         # vae only or full model

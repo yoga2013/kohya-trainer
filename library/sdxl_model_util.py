@@ -88,11 +88,11 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
     # Load the state dict
     if model_util.is_safetensors(ckpt_path):
         checkpoint = None
-        state_dict = load_file(ckpt_path, device=map_location)
+        state_dict = load_file(ckpt_path, device="cpu")
         epoch = None
         global_step = None
     else:
-        checkpoint = torch.load(ckpt_path, map_location=map_location)
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint.get("epoch", 0)
@@ -103,9 +103,11 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
             global_step = 0
         checkpoint = None
 
+    device_tweak = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # U-Net
     print("building U-Net")
-    unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+    unet = sdxl_original_unet.SdxlUNet2DConditionModel().to(device_tweak)
 
     print("loading U-Net from checkpoint")
     unet_sd = {}
@@ -141,7 +143,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+    text_model1 = CLIPTextModel._from_config(text_model1_cfg).to(device_tweak)
 
     # Text Encoder 2 is different from SDXL. SDXL uses open clip, but we use the model from HuggingFace.
     # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
@@ -166,7 +168,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
+    text_model2 = CLIPTextModelWithProjection(text_model2_cfg).to(device_tweak)
 
     print("loading text encoders from checkpoint")
     te1_sd = {}
@@ -187,7 +189,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location):
     # prepare vae
     print("building VAE")
     vae_config = model_util.create_vae_diffusers_config()
-    vae = AutoencoderKL(**vae_config)  # .to(device)
+    vae = AutoencoderKL(**vae_config).to(device_tweak)  # .to(device)
 
     print("loading VAE from checkpoint")
     converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
@@ -280,7 +282,7 @@ def save_stable_diffusion_checkpoint(
         for k, v in sd.items():
             key = prefix + k
             if save_dtype is not None:
-                v = v.detach().clone().to("cpu").to(save_dtype)
+                v = v.detach().clone().to("cuda").to(save_dtype)
             state_dict[key] = v
 
     # Convert the UNet model

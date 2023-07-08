@@ -52,11 +52,11 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # メモリ消費を減らす
-                print("move vae and unet to cpu to save memory")
+                print("move vae and unet to cuda to save memory")
                 org_vae_device = vae.device
                 org_unet_device = unet.device
-                vae.to("cpu")
-                unet.to("cpu")
+                vae.to("cuda")
+                unet.to("cuda")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -64,8 +64,8 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 args, accelerator, tokenizers, text_encoders, data_loader, weight_dtype
             )
             accelerator.wait_for_everyone()
-            text_encoders[0].to("cpu", dtype=torch.float32) # Text Encoder doesn't work with fp16 on CPU
-            text_encoders[1].to("cpu", dtype=torch.float32)
+            text_encoders[0].to("cuda", dtype=torch.float32) # Text Encoder doesn't work with fp16 on CPU
+            text_encoders[1].to("cuda", dtype=torch.float32)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
