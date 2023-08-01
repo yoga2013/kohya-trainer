@@ -55,7 +55,6 @@ from diffusers import (
 from library import custom_train_functions
 from library.original_unet import UNet2DConditionModel
 from huggingface_hub import hf_hub_download
-import albumentations as albu
 import numpy as np
 from PIL import Image
 import cv2
@@ -65,6 +64,7 @@ import safetensors.torch
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
+
 # from library.attention_processors import FlashAttnProcessor
 # from library.hypernetwork import replace_attentions_for_hypernetwork
 from library.original_unet import UNet2DConditionModel
@@ -284,42 +284,40 @@ class BucketBatchIndex(NamedTuple):
 
 
 class AugHelper:
+    # albumentationsへの依存をなくしたがとりあえず同じinterfaceを持たせる
+
     def __init__(self):
-        # prepare all possible augmentators
-        self.color_aug_method = albu.OneOf(
-            [
-                albu.HueSaturationValue(8, 0, 0, p=0.5),
-                albu.RandomGamma((95, 105), p=0.5),
-            ],
-            p=0.33,
-        )
+        pass
 
-        # key: (use_color_aug, use_flip_aug)
-        # self.augmentors = {
-        #     (True, True): albu.Compose(
-        #         [
-        #             color_aug_method,
-        #             flip_aug_method,
-        #         ],
-        #         p=1.0,
-        #     ),
-        #     (True, False): albu.Compose(
-        #         [
-        #             color_aug_method,
-        #         ],
-        #         p=1.0,
-        #     ),
-        #     (False, True): albu.Compose(
-        #         [
-        #             flip_aug_method,
-        #         ],
-        #         p=1.0,
-        #     ),
-        #     (False, False): None,
-        # }
+    def color_aug(self, image: np.ndarray):
+        # self.color_aug_method = albu.OneOf(
+        #     [
+        #         albu.HueSaturationValue(8, 0, 0, p=0.5),
+        #         albu.RandomGamma((95, 105), p=0.5),
+        #     ],
+        #     p=0.33,
+        # )
+        hue_shift_limit = 8
 
-    def get_augmentor(self, use_color_aug: bool) -> Optional[albu.Compose]:
-        return self.color_aug_method if use_color_aug else None
+        # remove dependency to albumentations
+        if random.random() <= 0.33:
+            if random.random() > 0.5:
+                # hue shift
+                hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+                hue_shift = random.uniform(-hue_shift_limit, hue_shift_limit)
+                if hue_shift < 0:
+                    hue_shift = 180 + hue_shift
+                hsv_img[:, :, 0] = (hsv_img[:, :, 0] + hue_shift) % 180
+                image = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+            else:
+                # random gamma
+                gamma = random.uniform(0.95, 1.05)
+                image = np.clip(image**gamma, 0, 255).astype(np.uint8)
+
+        return {"image": image}
+
+    def get_augmentor(self, use_color_aug: bool):  # -> Optional[Callable[[np.ndarray], Dict[str, np.ndarray]]]:
+        return self.color_aug if use_color_aug else None
 
 
 class BaseSubset:
@@ -2166,6 +2164,9 @@ def cache_batch_latents(
             if flip_aug:
                 info.latents_flipped = flipped_latent
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def cache_batch_text_encoder_outputs(
     image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, input_ids1, input_ids2, dtype
@@ -2867,6 +2868,11 @@ def verify_training_args(args: argparse.Namespace):
         raise ValueError(
             "scale_v_pred_loss_like_noise_pred can be enabled only with v_parameterization / scale_v_pred_loss_like_noise_predはv_parameterizationが有効なときのみ有効にできます"
         )
+    
+    if args.v_pred_like_loss and args.v_parameterization:
+        raise ValueError(
+            "v_pred_like_loss cannot be enabled with v_parameterization / v_pred_like_lossはv_parameterizationが有効なときには有効にできません"
+        )
 
     if args.zero_terminal_snr and not args.v_parameterization:
         print(
@@ -3181,32 +3187,9 @@ def get_optimizer(args, trainable_params):
     # print("optkwargs:", optimizer_kwargs)
 
     lr = args.learning_rate
+    optimizer = None
 
-    if optimizer_type == "AdamW8bit".lower():
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError("No bitsand bytes / bitsandbytesがインストールされていないようです")
-        print(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
-        optimizer_class = bnb.optim.AdamW8bit
-        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-
-    elif optimizer_type == "SGDNesterov8bit".lower():
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError("No bitsand bytes / bitsandbytesがインストールされていないようです")
-        print(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")
-        if "momentum" not in optimizer_kwargs:
-            print(
-                f"8-bit SGD with Nesterov must be with momentum, set momentum to 0.9 / 8-bit SGD with Nesterovはmomentum指定が必須のため0.9に設定します"
-            )
-            optimizer_kwargs["momentum"] = 0.9
-
-        optimizer_class = bnb.optim.SGD8bit
-        optimizer = optimizer_class(trainable_params, lr=lr, nesterov=True, **optimizer_kwargs)
-
-    elif optimizer_type == "Lion".lower():
+    if optimizer_type == "Lion".lower():
         try:
             import lion_pytorch
         except ImportError:
@@ -3214,37 +3197,53 @@ def get_optimizer(args, trainable_params):
         print(f"use Lion optimizer | {optimizer_kwargs}")
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-        
+
     elif optimizer_type.endswith("8bit".lower()):
         try:
             import bitsandbytes as bnb
         except ImportError:
             raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
 
-        if optimizer_type == "Lion8bit".lower():
-                print(f"use 8-bit Lion optimizer | {optimizer_kwargs}")
-                try:
-                    optimizer_class = bnb.optim.Lion8bit
-                except AttributeError:
-                    raise AttributeError(
-                        "No Lion8bit. The version of bitsandbytes installed seems to be old. Please install 0.38.0 or later. / Lion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.38.0以上をインストールしてください"
-                    )
+        if optimizer_type == "AdamW8bit".lower():
+            print(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = bnb.optim.AdamW8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "SGDNesterov8bit".lower():
+            print(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")
+            if "momentum" not in optimizer_kwargs:
+                print(
+                    f"8-bit SGD with Nesterov must be with momentum, set momentum to 0.9 / 8-bit SGD with Nesterovはmomentum指定が必須のため0.9に設定します"
+                )
+                optimizer_kwargs["momentum"] = 0.9
+
+            optimizer_class = bnb.optim.SGD8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, nesterov=True, **optimizer_kwargs)
+
+        elif optimizer_type == "Lion8bit".lower():
+            print(f"use 8-bit Lion optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.Lion8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No Lion8bit. The version of bitsandbytes installed seems to be old. Please install 0.38.0 or later. / Lion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.38.0以上をインストールしてください"
+                )
         elif optimizer_type == "PagedAdamW8bit".lower():
-                print(f"use 8-bit PagedAdamW optimizer | {optimizer_kwargs}")
-                try:
-                    optimizer_class = bnb.optim.PagedAdamW8bit
-                except AttributeError:
-                    raise AttributeError(
-                        "No PagedAdamW8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedAdamW8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
-                    )
+            print(f"use 8-bit PagedAdamW optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.PagedAdamW8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No PagedAdamW8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedAdamW8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
+                )
         elif optimizer_type == "PagedLion8bit".lower():
-                print(f"use 8-bit Paged Lion optimizer | {optimizer_kwargs}")
-                try:
-                    optimizer_class = bnb.optim.PagedLion8bit
-                except AttributeError:
-                    raise AttributeError(
-                        "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedLion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
-                    )
+            print(f"use 8-bit Paged Lion optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.PagedLion8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedLion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
+                )
 
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
@@ -3376,7 +3375,7 @@ def get_optimizer(args, trainable_params):
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-    else:
+    if optimizer is None:
         # 任意のoptimizerを使う
         optimizer_type = args.optimizer_type  # lowerでないやつ（微妙）
         print(f"use {optimizer_type} | {optimizer_kwargs}")
@@ -3396,10 +3395,8 @@ def get_optimizer(args, trainable_params):
     return optimizer_name, optimizer_args, optimizer
 
 
-# Monkeypatch newer get_scheduler() function overridng current version of diffusers.optimizer.get_scheduler
-# code is taken from https://github.com/huggingface/diffusers diffusers.optimizer, commit d87cc15977b87160c30abaace3894e802ad9e1e6
-# Which is a newer release of diffusers than currently packaged with sd-scripts
-# This code can be removed when newer diffusers version (v0.12.1 or greater) is tested and implemented to sd-scripts
+# Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
+# Add some checking and features to the original function.
 
 
 def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
@@ -3416,19 +3413,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
         for arg in args.lr_scheduler_args:
             key, value = arg.split("=")
-
             value = ast.literal_eval(value)
-            # value = value.split(",")
-            # for i in range(len(value)):
-            #     if value[i].lower() == "true" or value[i].lower() == "false":
-            #         value[i] = value[i].lower() == "true"
-            #     else:
-            #         value[i] = ast.literal_eval(value[i])
-            # if len(value) == 1:
-            #     value = value[0]
-            # else:
-            #     value = list(value)  # some may use list?
-
             lr_scheduler_kwargs[key] = value
 
     def wrap_check_needless_num_warmup_steps(return_vals):
@@ -3460,15 +3445,19 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
+
     if name == SchedulerType.CONSTANT:
-        return wrap_check_needless_num_warmup_steps(schedule_func(optimizer))
+        return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+
+    if name == SchedulerType.PIECEWISE_CONSTANT:
+        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
 
     # All other schedulers require `num_warmup_steps`
     if num_warmup_steps is None:
         raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
     if name == SchedulerType.CONSTANT_WITH_WARMUP:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps)
+        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
 
     # All other schedulers require `num_training_steps`
     if num_training_steps is None:
@@ -3476,13 +3465,19 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
 
     if name == SchedulerType.COSINE_WITH_RESTARTS:
         return schedule_func(
-            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, num_cycles=num_cycles
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=num_cycles,
+            **lr_scheduler_kwargs,
         )
 
     if name == SchedulerType.POLYNOMIAL:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power)
+        return schedule_func(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power, **lr_scheduler_kwargs
+        )
 
-    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, **lr_scheduler_kwargs)
 
 
 def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
